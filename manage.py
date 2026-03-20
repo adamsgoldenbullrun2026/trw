@@ -570,7 +570,13 @@ class Handler(BaseHTTPRequestHandler):
     def _serve_manage(self, env, message=""):
         """Render management dashboard for returning users."""
         workspace = get_modal_workspace()
-        dashboard_url = f"https://{workspace}--signal-bot-web.modal.run" if workspace else ""
+        dash_token = env.get("DASHBOARD_TOKEN", "")
+        if workspace:
+            dashboard_url = f"https://{workspace}--signal-bot-web.modal.run"
+            if dash_token:
+                dashboard_url += f"?token={dash_token}"
+        else:
+            dashboard_url = ""
 
         trw_token = env.get("TRW_SESSION_TOKEN", "")
         hl_key = env.get("HYPERLIQUID_API_PRIVATE_KEY", "")

@@ -156,7 +156,7 @@ def get_slack_webhook():
     return webhook
 
 
-def create_env_file(trw_token, api_key, master_addr, slack_webhook):
+def create_env_file(trw_token, api_key, master_addr, slack_webhook, dashboard_token=""):
     print_step(4, 5, "Creating .env File")
     env_content = f"""# TRW (The Real World)
 TRW_SESSION_TOKEN={trw_token}
@@ -170,6 +170,8 @@ HYPERLIQUID_MASTER_ACCOUNT_ADDRESS={master_addr}
 # Slack (optional — leave empty to disable notifications)
 SLACK_WEBHOOK_URL={slack_webhook}
 """
+    if dashboard_token:
+        env_content += f"\n# Dashboard\nDASHBOARD_TOKEN={dashboard_token}\n"
     with open(".env", "w") as f:
         f.write(env_content)
     print("  .env file created ✓")
@@ -261,12 +263,14 @@ def deploy_to_modal(trw_token, api_key, master_addr, slack_webhook):
                 pass
 
         if dashboard_url:
-            print(f"\n  Dashboard URL: {dashboard_url}")
+            # Include dashboard token so the link actually works
+            authed_url = f"{dashboard_url}?token={dashboard_token}"
+            print(f"\n  Dashboard URL: {authed_url}")
             print(f"  Bookmark this on your phone!")
             # Open in browser
             try:
                 import webbrowser
-                webbrowser.open(dashboard_url)
+                webbrowser.open(authed_url)
                 print(f"  (Opening in your browser...)")
             except Exception:
                 pass
@@ -328,7 +332,9 @@ def load_current_env():
 
 def save_and_deploy(trw_token, api_key, master_addr, slack_webhook):
     """Save .env, update Modal secrets, and redeploy."""
-    create_env_file(trw_token, api_key, master_addr, slack_webhook)
+    # Generate dashboard token early so it gets saved to .env
+    _dashboard_token = secrets.token_urlsafe(24)
+    create_env_file(trw_token, api_key, master_addr, slack_webhook, dashboard_token=_dashboard_token)
     print()
     deploy = ask("  Update Modal secrets and redeploy? (y/n): ")
     if deploy.lower() in ("y", "yes"):
@@ -351,11 +357,27 @@ def print_deploy_success():
     except Exception:
         dash_url = "https://YOUR_WORKSPACE--signal-bot-web.modal.run"
 
+    # Read dashboard token from .env if available
+    dash_token = ""
+    if os.path.exists(".env"):
+        with open(".env") as f:
+            for line in f:
+                if line.strip().startswith("DASHBOARD_TOKEN="):
+                    dash_token = line.strip().split("=", 1)[1]
+    # Also check Modal secrets env
+    if not dash_token:
+        dash_token = os.environ.get("DASHBOARD_TOKEN", "")
+
+    if dash_token:
+        display_url = f"{dash_url}?token={dash_token}"
+    else:
+        display_url = dash_url
+
     print_header("Setup Complete!")
     print("  Your signal bot is now running in the cloud.")
     print("  It will automatically check for new signals and rebalance.")
     print()
-    print(f"  DASHBOARD: {dash_url}")
+    print(f"  DASHBOARD: {display_url}")
     print(f"  Bookmark this on your phone!")
     print()
     print("  Schedule (UTC):")
