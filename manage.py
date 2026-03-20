@@ -384,6 +384,7 @@ MANAGE_HTML = """<!DOCTYPE html>
 </div>
 
 <form method="POST">
+<input type="hidden" name="csrf_token" value="{csrf_token}">
 <input type="hidden" name="mode" value="manage">
 
 <h2>Status</h2>
