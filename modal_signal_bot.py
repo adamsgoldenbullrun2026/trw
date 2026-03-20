@@ -93,6 +93,7 @@ def find_latest_signal(messages: list[dict]) -> dict | None:
 
 
 def parse_signal(content: str) -> dict:
+    """Parse signal — synced with trw_signal_reader.py's parse_signal."""
     result = {"allocations": [], "no_change": False, "btc_leverage": None}
 
     exec_match = re.search(r"Executive Summary:(.+?)(?:Associated Data|$)", content, re.DOTALL)
@@ -103,8 +104,10 @@ def parse_signal(content: str) -> dict:
         r"\*?\*?(\d+(?:\.\d+)?)\s*%\s*(Spot|Gold|Leverage)?\s*\$?([\w/\$]+)\*?\*?",
         re.IGNORECASE,
     )
+    # Handles multiple format eras: "RSPS Signal:", "Risk-On Crypto Signal:", "**Signal:**"
     signal_section = re.search(
-        r"RSPS Signal.*?(?:Executive Summary|Associated Data|───|$)",
+        r"(?:RSPS Signal|Risk-On Crypto Signal|\*\*Signal:\*\*)\s*:?\s*\*?\*?"
+        r"(.+?)(?:Executive Summary|Associated Data|Dominant Denominator|───|$)",
         content, re.DOTALL,
     )
     if signal_section:
@@ -116,6 +119,19 @@ def parse_signal(content: str) -> dict:
                 gold_match = re.search(r"PAXG(?:\s*/\s*\$?XAUT)?", section_text, re.IGNORECASE)
                 asset = gold_match.group(0).upper().replace(" ", "").replace("$", "") if gold_match else "PAXG/XAUT"
                 alloc_type = "Gold"
+            elif asset == "CASH" or (alloc_type and alloc_type.lower() == "cash"):
+                # Cash allocation — check Dominant Denominator for what to hold
+                dom_match = re.search(
+                    r"Dominant Denominator.*?(?:GOLD|PAXG|USD)",
+                    content, re.DOTALL | re.IGNORECASE,
+                )
+                if dom_match and "gold" in dom_match.group(0).lower():
+                    alloc_type = "Gold"
+                    asset = "PAXG/XAUT"
+                else:
+                    # Default cash to USDC (stays in Hyperliquid wallet)
+                    alloc_type = "Cash"
+                    asset = "USDC"
             elif not alloc_type:
                 alloc_type = "Spot"
             else:
@@ -132,12 +148,12 @@ def parse_signal(content: str) -> dict:
 
 ASSET_MAP = {
     "ETH": "ETH", "BTC": "BTC", "HYPE": "HYPE", "SOL": "SOL",
-    "DOGE": "DOGE", "XRP": "XRP",
+    "SUI": "SUI", "DOGE": "DOGE", "XRP": "XRP", "AVAX": "AVAX",
+    "LINK": "LINK", "ADA": "ADA", "DOT": "DOT",
     "PAXG/XAUT": "PAXG", "PAXG": "PAXG", "XAUT": "PAXG", "GOLD": "PAXG",
 }
 MIN_TRADE_USD = 1.0
 MAX_SLIPPAGE = 0.03
-MAX_SINGLE_ORDER_USD = 50000
 
 
 def get_hl_clients():
@@ -186,10 +202,12 @@ def get_current_prices(info, assets):
 def compute_rebalance(allocations, account_value, current_positions, prices):
     trades = []
     target_positions = {}
+    skipped_assets = []
     for alloc in allocations:
         asset = alloc["asset"]
         hl_ticker = ASSET_MAP.get(asset, asset)
         if asset not in prices:
+            skipped_assets.append(f"{alloc['percent']}% {asset}")
             continue
         target_usd = account_value * (alloc["percent"] / 100.0)
         target_positions[hl_ticker] = {
@@ -224,14 +242,17 @@ def compute_rebalance(allocations, account_value, current_positions, prices):
         delta_usd = abs(delta_size) * price
         if delta_usd < MIN_TRADE_USD:
             continue
-        if delta_usd > MAX_SINGLE_ORDER_USD:
-            delta_size = (MAX_SINGLE_ORDER_USD / price) * (1 if delta_size > 0 else -1)
-            delta_usd = MAX_SINGLE_ORDER_USD
         trades.append({
             "asset": asset, "hl_ticker": ticker,
             "side": "buy" if delta_size > 0 else "sell",
             "size": abs(delta_size), "value_usd": delta_usd, "price": price,
         })
+    if skipped_assets:
+        send_slack(
+            f"WARNING: Could not find price for: {', '.join(skipped_assets)}. "
+            f"These allocations will stay in cash. You may need to add them to ASSET_MAP.",
+            mention=True,
+        )
     trades.sort(key=lambda t: (0 if t["side"] == "sell" else 1, -t["value_usd"]))
     return trades
 
@@ -454,7 +475,7 @@ def web(action: str = "", token: str = ""):
     # C1 FIX: All actions except health require authentication
     dashboard_token = os.environ.get("DASHBOARD_TOKEN", "")
     if action in ("force", "dismiss", ""):
-        if dashboard_token and token != dashboard_token:
+        if not dashboard_token or token != dashboard_token:
             return HTMLResponse(_page("Unauthorized", "Invalid or missing dashboard token. Add ?token=YOUR_DASHBOARD_TOKEN to the URL."), status_code=403)
 
     # ── Approve ──

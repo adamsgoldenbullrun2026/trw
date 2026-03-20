@@ -40,7 +40,6 @@ MASTER_ADDRESS = os.getenv("HYPERLIQUID_MASTER_ACCOUNT_ADDRESS")
 # Safety limits
 MIN_TRADE_USD = 1.0          # Don't bother with trades smaller than $1
 MAX_SLIPPAGE = 0.03           # 3% max slippage on market orders
-MAX_SINGLE_ORDER_USD = 50000  # Safety cap per single order
 
 # Asset mapping: signal name → Hyperliquid perp ticker
 ASSET_MAP = {
@@ -48,8 +47,13 @@ ASSET_MAP = {
     "BTC": "BTC",
     "HYPE": "HYPE",
     "SOL": "SOL",
+    "SUI": "SUI",
     "DOGE": "DOGE",
     "XRP": "XRP",
+    "AVAX": "AVAX",
+    "LINK": "LINK",
+    "ADA": "ADA",
+    "DOT": "DOT",
     "PAXG/XAUT": "PAXG",   # Use PAXG perp for gold exposure
     "PAXG": "PAXG",
     "XAUT": "PAXG",         # Map XAUT to PAXG as well
@@ -189,12 +193,6 @@ def compute_rebalance(
         if delta_usd < MIN_TRADE_USD:
             continue  # Skip tiny trades
 
-        if delta_usd > MAX_SINGLE_ORDER_USD:
-            print(f"WARNING: Trade for {asset} (${delta_usd:.2f}) exceeds safety cap of ${MAX_SINGLE_ORDER_USD}. Capping.",
-                  file=sys.stderr)
-            delta_size = (MAX_SINGLE_ORDER_USD / price) * (1 if delta_size > 0 else -1)
-            delta_usd = MAX_SINGLE_ORDER_USD
-
         trades.append({
             "asset": asset,
             "hl_ticker": ticker,
@@ -253,7 +251,7 @@ def execute_trades(info: Info, exchange: Exchange, trades: list[dict]) -> list[d
     trades = [t for t in trades if t["hl_ticker"] not in failed_tickers]
     if not trades:
         print("  ALL trades skipped — could not confirm 1x leverage on any asset")
-        return 0, 0
+        return results
 
     for trade in trades:
         ticker = trade["hl_ticker"]
@@ -352,7 +350,15 @@ def print_preview(trades: list[dict], account_value: float):
 def load_signal_from_file(path: str) -> dict:
     """Load parsed signal from a JSON file."""
     with open(path) as f:
-        return json.load(f)
+        data = json.load(f)
+    if not isinstance(data, dict) or "allocations" not in data:
+        print(f"ERROR: Signal JSON must have an 'allocations' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}",
+              file=sys.stderr)
+        sys.exit(1)
+    if not isinstance(data["allocations"], list):
+        print(f"ERROR: 'allocations' must be a list, got {type(data['allocations']).__name__}", file=sys.stderr)
+        sys.exit(1)
+    return data
 
 
 def load_signal_live() -> dict:
@@ -402,6 +408,15 @@ def main():
     if signal.get("no_change"):
         print("Signal says NO CHANGE. No trades needed.")
         return
+
+    # Validate allocations sum to ~100% before trading
+    alloc_sum = sum(a["percent"] for a in signal["allocations"])
+    if alloc_sum < 95 or alloc_sum > 105:
+        print(f"ERROR: Allocation sum is {alloc_sum:.1f}% (expected ~100%). Signal may be parsed incorrectly. NOT TRADING.",
+              file=sys.stderr)
+        allocs = ", ".join(f'{a["percent"]}% {a["asset"]}' for a in signal["allocations"])
+        print(f"  Allocations: {allocs}", file=sys.stderr)
+        sys.exit(1)
 
     # Get account state and prices
     state = get_account_state(info)

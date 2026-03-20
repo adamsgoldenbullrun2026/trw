@@ -59,20 +59,49 @@ def load_env():
 
 
 def save_env(values):
-    content = f"""# TRW (The Real World)
-TRW_SESSION_TOKEN={values.get('TRW_SESSION_TOKEN', '')}
-TRW_SIGNAL_CHANNEL_ID=01H83QAX979K9R7QTMH74ATR8C
-TRW_PROF_ADAM_USER_ID=01GHHHWZE7Q77AKGWZDGC5PDCN
+    # Preserve any existing env vars not in the form (e.g. DASHBOARD_TOKEN, MODAL_WORKSPACE)
+    existing = load_env() if ENV_PATH.exists() else {}
+    existing.update(values)
 
-# Hyperliquid
-HYPERLIQUID_API_PRIVATE_KEY={values.get('HYPERLIQUID_API_PRIVATE_KEY', '')}
-HYPERLIQUID_MASTER_ACCOUNT_ADDRESS={values.get('HYPERLIQUID_MASTER_ACCOUNT_ADDRESS', '')}
+    # Known keys in display order, then any extras
+    known_sections = [
+        ("# TRW (The Real World)", [
+            "TRW_SESSION_TOKEN",
+            "TRW_SIGNAL_CHANNEL_ID",
+            "TRW_PROF_ADAM_USER_ID",
+        ]),
+        ("# Hyperliquid", [
+            "HYPERLIQUID_API_PRIVATE_KEY",
+            "HYPERLIQUID_MASTER_ACCOUNT_ADDRESS",
+        ]),
+        ("# Slack (optional)", [
+            "SLACK_WEBHOOK_URL",
+        ]),
+    ]
 
-# Slack (optional)
-SLACK_WEBHOOK_URL={values.get('SLACK_WEBHOOK_URL', '')}
-"""
+    # Ensure defaults for static keys
+    existing.setdefault("TRW_SIGNAL_CHANNEL_ID", "01H83QAX979K9R7QTMH74ATR8C")
+    existing.setdefault("TRW_PROF_ADAM_USER_ID", "01GHHHWZE7Q77AKGWZDGC5PDCN")
+
+    lines = []
+    written_keys = set()
+    for header, keys in known_sections:
+        lines.append(header)
+        for key in keys:
+            lines.append(f"{key}={existing.get(key, '')}")
+            written_keys.add(key)
+        lines.append("")
+
+    # Append any extra keys not in the template (DASHBOARD_TOKEN, MODAL_WORKSPACE, etc.)
+    extras = {k: v for k, v in existing.items() if k not in written_keys}
+    if extras:
+        lines.append("# Additional settings")
+        for key, val in extras.items():
+            lines.append(f"{key}={val}")
+        lines.append("")
+
     with open(ENV_PATH, "w") as f:
-        f.write(content)
+        f.write("\n".join(lines))
 
 
 def has_real_config():
