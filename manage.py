@@ -213,6 +213,12 @@ def deploy_bot(values):
             os.remove(tmp_env)
         except OSError:
             pass
+    # Save dashboard token to local .env so manage.py can show the authed URL
+    existing = load_env()
+    existing["DASHBOARD_TOKEN"] = dashboard_token
+    existing["MODAL_WORKSPACE"] = modal_workspace
+    save_env(existing)
+
     r2 = subprocess.run(["modal", "deploy", "modal_signal_bot.py"], capture_output=True, env=env, timeout=120)
     if r2.returncode == 0:
         return True, "Deployed successfully"
