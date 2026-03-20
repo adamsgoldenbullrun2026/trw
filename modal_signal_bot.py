@@ -11,13 +11,13 @@ Trading mode:
   00:00-05:00  → fully autonomous (auto-execute)
   05:00-00:00  → approval required (Slack + dashboard link)
 
-Deploy:  PYTHONUTF8=1 modal deploy modal_signal_bot.py
-Dashboard: https://<your-workspace>--signal-bot-web.modal.run
+Deploy:  PYTHONUTF8=1 modal deploy execution/modal_signal_bot.py
+Dashboard: https://finnharris05--signal-bot-dashboard.modal.run
 
 Required secrets (signal-bot-secrets):
     TRW_SESSION_TOKEN, TRW_SIGNAL_CHANNEL_ID, TRW_PROF_ADAM_USER_ID
     HYPERLIQUID_API_PRIVATE_KEY, HYPERLIQUID_MASTER_ACCOUNT_ADDRESS
-    SLACK_WEBHOOK_URL (optional)
+    SLACK_BOT_TOKEN, SLACK_NOTIFY_USER_ID
 """
 
 import os
@@ -44,17 +44,24 @@ image = (
 
 # ── Slack ───────────────────────────────────────────────────────────────────
 
+SLACK_CHANNEL = "C0AMK49M1UK"
+
+
 def send_slack(text: str, mention: bool = False):
-    """Send notification via Slack incoming webhook. Silently skips if not configured."""
     import requests as req
-    webhook_url = os.environ.get("SLACK_WEBHOOK_URL", "")
-    if not webhook_url:
+    token = os.environ.get("SLACK_BOT_TOKEN", "")
+    if not token:
         print(f"[SLACK SKIPPED] {text}")
         return
-    try:
-        req.post(webhook_url, json={"text": text}, timeout=10)
-    except Exception as e:
-        print(f"[SLACK ERROR] {e}")
+    user_id = os.environ.get("SLACK_NOTIFY_USER_ID", "")
+    if mention and user_id:
+        text = f"<@{user_id}> {text}"
+    req.post(
+        "https://slack.com/api/chat.postMessage",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        json={"channel": SLACK_CHANNEL, "text": text},
+        timeout=10,
+    )
 
 
 # ── TRW Signal Reader ──────────────────────────────────────────────────────
@@ -93,7 +100,6 @@ def find_latest_signal(messages: list[dict]) -> dict | None:
 
 
 def parse_signal(content: str) -> dict:
-    """Parse signal — synced with trw_signal_reader.py's parse_signal."""
     result = {"allocations": [], "no_change": False, "btc_leverage": None}
 
     exec_match = re.search(r"Executive Summary:(.+?)(?:Associated Data|$)", content, re.DOTALL)
@@ -104,10 +110,8 @@ def parse_signal(content: str) -> dict:
         r"\*?\*?(\d+(?:\.\d+)?)\s*%\s*(Spot|Gold|Leverage)?\s*\$?([\w/\$]+)\*?\*?",
         re.IGNORECASE,
     )
-    # Handles multiple format eras: "RSPS Signal:", "Risk-On Crypto Signal:", "**Signal:**"
     signal_section = re.search(
-        r"(?:RSPS Signal|Risk-On Crypto Signal|\*\*Signal:\*\*)\s*:?\s*\*?\*?"
-        r"(.+?)(?:Executive Summary|Associated Data|Dominant Denominator|───|$)",
+        r"RSPS Signal.*?(?:Executive Summary|Associated Data|───|$)",
         content, re.DOTALL,
     )
     if signal_section:
@@ -119,19 +123,6 @@ def parse_signal(content: str) -> dict:
                 gold_match = re.search(r"PAXG(?:\s*/\s*\$?XAUT)?", section_text, re.IGNORECASE)
                 asset = gold_match.group(0).upper().replace(" ", "").replace("$", "") if gold_match else "PAXG/XAUT"
                 alloc_type = "Gold"
-            elif asset == "CASH" or (alloc_type and alloc_type.lower() == "cash"):
-                # Cash allocation — check Dominant Denominator for what to hold
-                dom_match = re.search(
-                    r"Dominant Denominator.*?(?:GOLD|PAXG|USD)",
-                    content, re.DOTALL | re.IGNORECASE,
-                )
-                if dom_match and "gold" in dom_match.group(0).lower():
-                    alloc_type = "Gold"
-                    asset = "PAXG/XAUT"
-                else:
-                    # Default cash to USDC (stays in Hyperliquid wallet)
-                    alloc_type = "Cash"
-                    asset = "USDC"
             elif not alloc_type:
                 alloc_type = "Spot"
             else:
@@ -148,12 +139,12 @@ def parse_signal(content: str) -> dict:
 
 ASSET_MAP = {
     "ETH": "ETH", "BTC": "BTC", "HYPE": "HYPE", "SOL": "SOL",
-    "SUI": "SUI", "DOGE": "DOGE", "XRP": "XRP", "AVAX": "AVAX",
-    "LINK": "LINK", "ADA": "ADA", "DOT": "DOT",
+    "DOGE": "DOGE", "XRP": "XRP",
     "PAXG/XAUT": "PAXG", "PAXG": "PAXG", "XAUT": "PAXG", "GOLD": "PAXG",
 }
 MIN_TRADE_USD = 1.0
 MAX_SLIPPAGE = 0.03
+MAX_SINGLE_ORDER_USD = 50000
 
 
 def get_hl_clients():
@@ -202,12 +193,10 @@ def get_current_prices(info, assets):
 def compute_rebalance(allocations, account_value, current_positions, prices):
     trades = []
     target_positions = {}
-    skipped_assets = []
     for alloc in allocations:
         asset = alloc["asset"]
         hl_ticker = ASSET_MAP.get(asset, asset)
         if asset not in prices:
-            skipped_assets.append(f"{alloc['percent']}% {asset}")
             continue
         target_usd = account_value * (alloc["percent"] / 100.0)
         target_positions[hl_ticker] = {
@@ -218,64 +207,46 @@ def compute_rebalance(allocations, account_value, current_positions, prices):
     for coin in current_positions:
         if current_positions[coin]["size"] != 0:
             all_tickers.add(coin)
-    # H2 FIX: Fetch all current market prices for positions we need to close
-    all_mids = {}
-    try:
-        import requests as _req
-        _resp = _req.post("https://api.hyperliquid.xyz/info", json={"type": "allMids"}, timeout=10)
-        all_mids = {k: float(v) for k, v in _resp.json().items()}
-    except Exception:
-        pass
     for ticker in all_tickers:
         current_size = current_positions.get(ticker, {}).get("size", 0)
         target = target_positions.get(ticker)
         if target:
             target_size, price, asset = target["target_size"], target["price"], target["asset"]
         else:
-            # Use live market price, fall back to entry_px, skip if both are 0
-            price = all_mids.get(ticker, 0) or current_positions[ticker].get("entry_px", 0)
-            if price == 0:
-                print(f"WARNING: Cannot close {ticker} — no price available. Skipping.")
-                continue
+            price = current_positions[ticker].get("entry_px", 0)
             target_size, asset = 0, ticker
         delta_size = target_size - current_size
         delta_usd = abs(delta_size) * price
         if delta_usd < MIN_TRADE_USD:
             continue
+        if delta_usd > MAX_SINGLE_ORDER_USD:
+            delta_size = (MAX_SINGLE_ORDER_USD / price) * (1 if delta_size > 0 else -1)
+            delta_usd = MAX_SINGLE_ORDER_USD
         trades.append({
             "asset": asset, "hl_ticker": ticker,
             "side": "buy" if delta_size > 0 else "sell",
             "size": abs(delta_size), "value_usd": delta_usd, "price": price,
         })
-    if skipped_assets:
-        send_slack(
-            f"WARNING: Could not find price for: {', '.join(skipped_assets)}. "
-            f"These allocations will stay in cash. You may need to add them to ASSET_MAP.",
-            mention=True,
-        )
     trades.sort(key=lambda t: (0 if t["side"] == "sell" else 1, -t["value_usd"]))
     return trades
 
 
 def execute_trades(info, exchange, trades):
     results = []
-    # C3 FIX: If leverage setting fails, ABORT that trade entirely
-    leverage_ok = set()
+    leverage_failed = set()
     for ticker in {t["hl_ticker"] for t in trades}:
         try:
             exchange.update_leverage(1, ticker, is_cross=True)
-            leverage_ok.add(ticker)
         except Exception as e:
-            send_slack(f"CRITICAL: Failed to set 1x leverage for {ticker}: {e} — SKIPPING ALL {ticker} TRADES", mention=True)
+            send_slack(f"ABORT {ticker}: Failed to set 1x leverage: {e}", mention=True)
+            leverage_failed.add(ticker)
         time.sleep(0.3)
-    # Filter out trades where leverage couldn't be confirmed
-    trades = [t for t in trades if t["hl_ticker"] in leverage_ok]
-    if not trades:
-        send_slack("ALL trades skipped — could not confirm 1x leverage on any asset", mention=True)
-        return results
     meta = info.meta()
     sz_dec_map = {a["name"]: a["szDecimals"] for a in meta["universe"]}
     for trade in trades:
+        if trade["hl_ticker"] in leverage_failed:
+            results.append({**trade, "status": "skipped", "reason": "leverage set failed"})
+            continue
         ticker = trade["hl_ticker"]
         sz_decimals = sz_dec_map.get(ticker, 2)
         size = float(Decimal(str(trade["size"])).quantize(Decimal(10) ** -sz_decimals, rounding=ROUND_DOWN))
@@ -329,17 +300,6 @@ def should_poll_now() -> bool:
 
 def do_rebalance(parsed: dict, msg_id: str) -> dict:
     """Execute a rebalance. Returns result dict."""
-    # H4 FIX: Validate allocations sum to ~100% before trading
-    alloc_sum = sum(a["percent"] for a in parsed["allocations"])
-    if alloc_sum < 95 or alloc_sum > 105:
-        send_slack(
-            f"ALLOCATION SUM ERROR: {alloc_sum:.1f}% (expected ~100%)\n"
-            f"Signal may have been parsed incorrectly. NOT TRADING.\n"
-            f"Allocations: {', '.join(f'{a[\"percent\"]}% {a[\"asset\"]}' for a in parsed['allocations'])}",
-            mention=True,
-        )
-        return {"status": "error", "error": f"allocation_sum_{alloc_sum:.1f}_pct"}
-
     info, exchange = get_hl_clients()
     state = get_account_state(info)
     account_value = state["account_value"]
@@ -437,12 +397,7 @@ def check_signal():
         signal_state["pending_msg_id"] = msg_id
         signal_state["approval_token"] = approval_token
 
-        # Dynamically build dashboard URL from Modal workspace
-        workspace = os.environ.get("MODAL_WORKSPACE", "")
-        if workspace:
-            dashboard_url = f"https://{workspace}--signal-bot-web.modal.run"
-        else:
-            dashboard_url = "(dashboard URL not configured — set MODAL_WORKSPACE in secrets)"
+        dashboard_url = "https://finnharris10k--signal-bot-web.modal.run"
         send_slack(
             f"NEW SIGNAL DETECTED — APPROVAL REQUIRED\n"
             f"{dt.strftime('%Y-%m-%d %H:%M UTC')}\n{alloc_lines}\n\n"
@@ -464,19 +419,13 @@ def check_signal():
 def web(action: str = "", token: str = ""):
     """
     Single web endpoint with action routing.
-    Dashboard: ?action=          (or no params) — requires DASHBOARD_TOKEN
+    Dashboard: ?action=          (or no params)
     Approve:   ?action=approve&token=xxx
-    Dismiss:   ?action=dismiss&token=xxx
-    Force:     ?action=force&token=xxx
+    Dismiss:   ?action=dismiss
+    Force:     ?action=force
     Health:    ?action=health
     """
     from fastapi.responses import HTMLResponse
-
-    # C1 FIX: All actions except health require authentication
-    dashboard_token = os.environ.get("DASHBOARD_TOKEN", "")
-    if action in ("force", "dismiss", ""):
-        if not dashboard_token or token != dashboard_token:
-            return HTMLResponse(_page("Unauthorized", "Invalid or missing dashboard token. Add ?token=YOUR_DASHBOARD_TOKEN to the URL."), status_code=403)
 
     # ── Approve ──
     if action == "approve":
@@ -563,18 +512,13 @@ def web(action: str = "", token: str = ""):
     return HTMLResponse(_render_dashboard())
 
 
-def _esc(s) -> str:
-    """HTML-escape to prevent XSS."""
-    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
-
-
 def _page(title: str, body: str) -> str:
     return f'''<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_esc(title)}</title>
+<title>{title}</title>
 <style>body {{ font-family: -apple-system, sans-serif; background: #0d1117; color: #e6edf3; padding: 24px; max-width: 600px; margin: 0 auto; }}
 a {{ color: #58a6ff; }}</style>
-</head><body><h2>{_esc(title)}</h2><p>{_esc(body)}</p><br><a href="?">Back to dashboard</a></body></html>'''
+</head><body><h2>{title}</h2><p>{body}</p><br><a href="?">Back to dashboard</a></body></html>'''
 
 
 def _render_dashboard() -> str:
@@ -617,7 +561,7 @@ def _render_dashboard() -> str:
     alloc_html = ""
     if parsed:
         for a in parsed["allocations"]:
-            alloc_html += f'<div class="alloc-row"><span class="pct">{_esc(a["percent"])}%</span><span class="type">{_esc(a["type"])}</span><span class="asset">{_esc(a["asset"])}</span></div>'
+            alloc_html += f'<div class="alloc-row"><span class="pct">{a["percent"]}%</span><span class="type">{a["type"]}</span><span class="asset">{a["asset"]}</span></div>'
 
     # Position rows
     pos_html = ""
@@ -630,7 +574,7 @@ def _render_dashboard() -> str:
         pnl_class = "positive" if pnl >= 0 else "negative"
         pct = (current_value / state["account_value"] * 100) if state["account_value"] > 0 else 0
         pos_html += f'''<div class="pos-row">
-            <span class="coin">{_esc(coin)}</span><span class="size">{pos["size"]:.4f}</span>
+            <span class="coin">{coin}</span><span class="size">{pos["size"]:.4f}</span>
             <span class="entry">${pos["entry_px"]:,.2f}</span><span class="current">${current_price:,.2f}</span>
             <span class="value">${current_value:,.2f}</span>
             <span class="pnl {pnl_class}">${pnl:+,.2f}</span><span class="alloc">{pct:.1f}%</span>
@@ -640,13 +584,11 @@ def _render_dashboard() -> str:
 
     pending_html = ""
     if pending and approval_token:
-        pa = "".join(f'<li>{_esc(a["percent"])}% {_esc(a["type"])} {_esc(a["asset"])}</li>' for a in pending["allocations"])
-        dt = os.environ.get("DASHBOARD_TOKEN", "")
-        dismiss_url = f"?action=dismiss&token={dt}" if dt else "?action=dismiss"
+        pa = "".join(f'<li>{a["percent"]}% {a["type"]} {a["asset"]}</li>' for a in pending["allocations"])
         pending_html = f'''<div class="pending-banner"><h3>Pending Signal — Approval Required</h3>
             <ul>{pa}</ul>
             <a href="?action=approve&token={approval_token}" class="btn btn-approve" onclick="return confirm('Execute rebalance now?')">APPROVE &amp; EXECUTE</a>
-            <a href="{dismiss_url}" class="btn btn-dismiss">Dismiss</a></div>'''
+            <a href="?action=dismiss" class="btn btn-dismiss">Dismiss</a></div>'''
 
     auto = is_autonomous_hours()
     mode_text = "AUTONOMOUS" if auto else "APPROVAL REQUIRED"
@@ -711,10 +653,10 @@ h2 {{ font-size: 1.1em; color: #8b949e; margin: 20px 0 8px; border-bottom: 1px s
     <div style="color:#8b949e;font-size:0.85em;margin-bottom:8px">{signal_time}</div>
     {alloc_html if alloc_html else '<div class="no-change">No signal found</div>'}
     {'<div class="no-change" style="margin-top:8px">Executive Summary: No change</div>' if parsed and parsed["no_change"] else ""}
-    {'<div style="margin-top:8px;font-size:0.85em;color:#8b949e">BTC Leverage: ' + _esc(parsed["btc_leverage"]) + '</div>' if parsed and parsed.get("btc_leverage") else ""}
+    {'<div style="margin-top:8px;font-size:0.85em;color:#8b949e">BTC Leverage: ' + parsed["btc_leverage"] + '</div>' if parsed and parsed.get("btc_leverage") else ""}
 </div>
 <div class="actions">
-    <a href="?action=force&token={os.environ.get('DASHBOARD_TOKEN', '')}" class="btn btn-action" onclick="return confirm('Force rebalance to current signal?')">Force Rebalance</a>
+    <a href="?action=force" class="btn btn-action" onclick="return confirm('Force rebalance to current signal?')">Force Rebalance</a>
     <a href="?action=health" class="btn btn-action">Health Check</a>
     <a href="?" class="btn btn-action">Refresh</a>
 </div>

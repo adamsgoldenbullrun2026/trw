@@ -30,7 +30,7 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+load_dotenv(Path(__file__).resolve().parent.parent / ".env")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
@@ -40,6 +40,7 @@ MASTER_ADDRESS = os.getenv("HYPERLIQUID_MASTER_ACCOUNT_ADDRESS")
 # Safety limits
 MIN_TRADE_USD = 1.0          # Don't bother with trades smaller than $1
 MAX_SLIPPAGE = 0.03           # 3% max slippage on market orders
+MAX_SINGLE_ORDER_USD = 50000  # Safety cap per single order
 
 # Asset mapping: signal name → Hyperliquid perp ticker
 ASSET_MAP = {
@@ -47,13 +48,8 @@ ASSET_MAP = {
     "BTC": "BTC",
     "HYPE": "HYPE",
     "SOL": "SOL",
-    "SUI": "SUI",
     "DOGE": "DOGE",
     "XRP": "XRP",
-    "AVAX": "AVAX",
-    "LINK": "LINK",
-    "ADA": "ADA",
-    "DOT": "DOT",
     "PAXG/XAUT": "PAXG",   # Use PAXG perp for gold exposure
     "PAXG": "PAXG",
     "XAUT": "PAXG",         # Map XAUT to PAXG as well
@@ -92,7 +88,7 @@ def get_account_state(info: Info) -> dict:
     for pos in state.get("assetPositions", []):
         p = pos["position"]
         coin = p["coin"]
-        size = float(p["sntl"])  if "sntl" in p else float(p["szi"])
+        size = float(p.get("szi", 0))
         entry_px = float(p["entryPx"]) if p.get("entryPx") else 0
         unrealized_pnl = float(p["unrealizedPnl"])
         position_value = abs(size) * entry_px
@@ -131,6 +127,7 @@ def compute_rebalance(
     account_value: float,
     current_positions: dict,
     prices: dict[str, float],
+    all_mids: dict[str, float] | None = None,
 ) -> list[dict]:
     """
     Compute the trades needed to rebalance from current positions to target allocations.
@@ -178,12 +175,18 @@ def compute_rebalance(
             asset = target["asset"]
         else:
             # Asset is in current positions but NOT in target → close it
-            price_data = prices.get(ticker)
-            if not price_data:
-                # Try to get price from all_mids
+            # Use current market price, NOT entry price
+            price = None
+            if all_mids and ticker in all_mids:
+                price = float(all_mids[ticker])
+            elif ticker in prices:
+                price = prices[ticker]
+            if not price:
                 price = current_positions[ticker].get("entry_px", 0)
-            else:
-                price = price_data
+                print(f"WARNING: No market price for {ticker} — using entry price ${price:.2f} to close", file=sys.stderr)
+                if not price:
+                    print(f"WARNING: No entry price either for {ticker} — skipping close", file=sys.stderr)
+                    continue
             target_size = 0
             asset = ticker
 
@@ -192,6 +195,12 @@ def compute_rebalance(
 
         if delta_usd < MIN_TRADE_USD:
             continue  # Skip tiny trades
+
+        if delta_usd > MAX_SINGLE_ORDER_USD:
+            print(f"WARNING: Trade for {asset} (${delta_usd:.2f}) exceeds safety cap of ${MAX_SINGLE_ORDER_USD}. Capping.",
+                  file=sys.stderr)
+            delta_size = (MAX_SINGLE_ORDER_USD / price) * (1 if delta_size > 0 else -1)
+            delta_usd = MAX_SINGLE_ORDER_USD
 
         trades.append({
             "asset": asset,
@@ -232,28 +241,25 @@ def execute_trades(info: Info, exchange: Exchange, trades: list[dict]) -> list[d
     results = []
 
     # Set 1x cross leverage for ALL assets we're about to trade
-    # If leverage setting fails, SKIP that asset's trades entirely
-    leveraged_tickers = set()
-    failed_tickers = set()
+    leveraged_ok = set()
+    leverage_failed = set()
     for trade in trades:
         ticker = trade["hl_ticker"]
-        if ticker not in leveraged_tickers and ticker not in failed_tickers:
+        if ticker not in leveraged_ok and ticker not in leverage_failed:
             print(f"  Setting {ticker} to 1x cross leverage...")
             try:
                 exchange.update_leverage(1, ticker, is_cross=True)
-                leveraged_tickers.add(ticker)
+                leveraged_ok.add(ticker)
             except Exception as e:
-                print(f"  CRITICAL: Failed to set leverage for {ticker}: {e} — SKIPPING ALL {ticker} TRADES")
-                failed_tickers.add(ticker)
+                print(f"  ABORT {ticker}: Failed to set 1x leverage: {e}", file=sys.stderr)
+                leverage_failed.add(ticker)
             time.sleep(0.3)
 
-    # Filter out trades where leverage couldn't be confirmed
-    trades = [t for t in trades if t["hl_ticker"] not in failed_tickers]
-    if not trades:
-        print("  ALL trades skipped — could not confirm 1x leverage on any asset")
-        return results
-
     for trade in trades:
+        if trade["hl_ticker"] in leverage_failed:
+            print(f"  SKIPPING {trade['hl_ticker']} — leverage not confirmed at 1x", file=sys.stderr)
+            results.append({**trade, "status": "skipped", "reason": "leverage set failed"})
+            continue
         ticker = trade["hl_ticker"]
         is_buy = trade["side"] == "buy"
         sz_decimals = get_sz_decimals(info, ticker)
@@ -350,15 +356,7 @@ def print_preview(trades: list[dict], account_value: float):
 def load_signal_from_file(path: str) -> dict:
     """Load parsed signal from a JSON file."""
     with open(path) as f:
-        data = json.load(f)
-    if not isinstance(data, dict) or "allocations" not in data:
-        print(f"ERROR: Signal JSON must have an 'allocations' key. Got: {list(data.keys()) if isinstance(data, dict) else type(data).__name__}",
-              file=sys.stderr)
-        sys.exit(1)
-    if not isinstance(data["allocations"], list):
-        print(f"ERROR: 'allocations' must be a list, got {type(data['allocations']).__name__}", file=sys.stderr)
-        sys.exit(1)
-    return data
+        return json.load(f)
 
 
 def load_signal_live() -> dict:
@@ -409,15 +407,6 @@ def main():
         print("Signal says NO CHANGE. No trades needed.")
         return
 
-    # Validate allocations sum to ~100% before trading
-    alloc_sum = sum(a["percent"] for a in signal["allocations"])
-    if alloc_sum < 95 or alloc_sum > 105:
-        print(f"ERROR: Allocation sum is {alloc_sum:.1f}% (expected ~100%). Signal may be parsed incorrectly. NOT TRADING.",
-              file=sys.stderr)
-        allocs = ", ".join(f'{a["percent"]}% {a["asset"]}' for a in signal["allocations"])
-        print(f"  Allocations: {allocs}", file=sys.stderr)
-        sys.exit(1)
-
     # Get account state and prices
     state = get_account_state(info)
     account_value = state["account_value"]
@@ -427,9 +416,10 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    # Get prices for all signal assets
+    # Get prices for all signal assets + all_mids for closing positions
     signal_assets = [a["asset"] for a in signal["allocations"]]
     prices = get_current_prices(info, signal_assets)
+    all_mids = {k: float(v) for k, v in info.all_mids().items()}
 
     # Compute trades
     trades = compute_rebalance(
@@ -437,6 +427,7 @@ def main():
         account_value,
         state["positions"],
         prices,
+        all_mids=all_mids,
     )
 
     # Preview or execute
