@@ -11,13 +11,14 @@ Trading mode:
   00:00-05:00  → fully autonomous (auto-execute)
   05:00-00:00  → approval required (Slack + dashboard link)
 
-Deploy:  PYTHONUTF8=1 modal deploy execution/modal_signal_bot.py
-Dashboard: https://finnharris05--signal-bot-dashboard.modal.run
+Deploy:  PYTHONUTF8=1 modal deploy modal_signal_bot.py
+Dashboard: https://<your-workspace>--signal-bot-web.modal.run
 
 Required secrets (signal-bot-secrets):
     TRW_SESSION_TOKEN, TRW_SIGNAL_CHANNEL_ID, TRW_PROF_ADAM_USER_ID
     HYPERLIQUID_API_PRIVATE_KEY, HYPERLIQUID_MASTER_ACCOUNT_ADDRESS
     SLACK_BOT_TOKEN, SLACK_NOTIFY_USER_ID
+    MODAL_WORKSPACE, DASHBOARD_TOKEN
 """
 
 import os
@@ -397,7 +398,12 @@ def check_signal():
         signal_state["pending_msg_id"] = msg_id
         signal_state["approval_token"] = approval_token
 
-        dashboard_url = "https://finnharris10k--signal-bot-web.modal.run"
+        # Dynamically build dashboard URL from Modal workspace
+        workspace = os.environ.get("MODAL_WORKSPACE", "")
+        if workspace:
+            dashboard_url = f"https://{workspace}--signal-bot-web.modal.run"
+        else:
+            dashboard_url = "(dashboard URL not configured — set MODAL_WORKSPACE in secrets)"
         send_slack(
             f"NEW SIGNAL DETECTED — APPROVAL REQUIRED\n"
             f"{dt.strftime('%Y-%m-%d %H:%M UTC')}\n{alloc_lines}\n\n"
@@ -419,13 +425,19 @@ def check_signal():
 def web(action: str = "", token: str = ""):
     """
     Single web endpoint with action routing.
-    Dashboard: ?action=          (or no params)
+    Dashboard: ?action=          (or no params) — requires DASHBOARD_TOKEN
     Approve:   ?action=approve&token=xxx
-    Dismiss:   ?action=dismiss
-    Force:     ?action=force
+    Dismiss:   ?action=dismiss&token=xxx
+    Force:     ?action=force&token=xxx
     Health:    ?action=health
     """
     from fastapi.responses import HTMLResponse
+
+    # All actions except health require authentication
+    dashboard_token = os.environ.get("DASHBOARD_TOKEN", "")
+    if action in ("force", "dismiss", ""):
+        if not dashboard_token or token != dashboard_token:
+            return HTMLResponse(_page("Unauthorized", "Invalid or missing dashboard token. Add ?token=YOUR_DASHBOARD_TOKEN to the URL."), status_code=403)
 
     # ── Approve ──
     if action == "approve":
@@ -512,13 +524,18 @@ def web(action: str = "", token: str = ""):
     return HTMLResponse(_render_dashboard())
 
 
+def _esc(s) -> str:
+    """HTML-escape to prevent XSS."""
+    return str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;").replace("'", "&#x27;")
+
+
 def _page(title: str, body: str) -> str:
     return f'''<!DOCTYPE html><html><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{title}</title>
+<title>{_esc(title)}</title>
 <style>body {{ font-family: -apple-system, sans-serif; background: #0d1117; color: #e6edf3; padding: 24px; max-width: 600px; margin: 0 auto; }}
 a {{ color: #58a6ff; }}</style>
-</head><body><h2>{title}</h2><p>{body}</p><br><a href="?">Back to dashboard</a></body></html>'''
+</head><body><h2>{_esc(title)}</h2><p>{_esc(body)}</p><br><a href="?">Back to dashboard</a></body></html>'''
 
 
 def _render_dashboard() -> str:
@@ -561,7 +578,7 @@ def _render_dashboard() -> str:
     alloc_html = ""
     if parsed:
         for a in parsed["allocations"]:
-            alloc_html += f'<div class="alloc-row"><span class="pct">{a["percent"]}%</span><span class="type">{a["type"]}</span><span class="asset">{a["asset"]}</span></div>'
+            alloc_html += f'<div class="alloc-row"><span class="pct">{_esc(a["percent"])}%</span><span class="type">{_esc(a["type"])}</span><span class="asset">{_esc(a["asset"])}</span></div>'
 
     # Position rows
     pos_html = ""
@@ -574,7 +591,7 @@ def _render_dashboard() -> str:
         pnl_class = "positive" if pnl >= 0 else "negative"
         pct = (current_value / state["account_value"] * 100) if state["account_value"] > 0 else 0
         pos_html += f'''<div class="pos-row">
-            <span class="coin">{coin}</span><span class="size">{pos["size"]:.4f}</span>
+            <span class="coin">{_esc(coin)}</span><span class="size">{pos["size"]:.4f}</span>
             <span class="entry">${pos["entry_px"]:,.2f}</span><span class="current">${current_price:,.2f}</span>
             <span class="value">${current_value:,.2f}</span>
             <span class="pnl {pnl_class}">${pnl:+,.2f}</span><span class="alloc">{pct:.1f}%</span>
@@ -584,11 +601,13 @@ def _render_dashboard() -> str:
 
     pending_html = ""
     if pending and approval_token:
-        pa = "".join(f'<li>{a["percent"]}% {a["type"]} {a["asset"]}</li>' for a in pending["allocations"])
+        pa = "".join(f'<li>{_esc(a["percent"])}% {_esc(a["type"])} {_esc(a["asset"])}</li>' for a in pending["allocations"])
+        dt = os.environ.get("DASHBOARD_TOKEN", "")
+        dismiss_url = f"?action=dismiss&token={dt}" if dt else "?action=dismiss"
         pending_html = f'''<div class="pending-banner"><h3>Pending Signal — Approval Required</h3>
             <ul>{pa}</ul>
             <a href="?action=approve&token={approval_token}" class="btn btn-approve" onclick="return confirm('Execute rebalance now?')">APPROVE &amp; EXECUTE</a>
-            <a href="?action=dismiss" class="btn btn-dismiss">Dismiss</a></div>'''
+            <a href="{dismiss_url}" class="btn btn-dismiss">Dismiss</a></div>'''
 
     auto = is_autonomous_hours()
     mode_text = "AUTONOMOUS" if auto else "APPROVAL REQUIRED"
@@ -653,10 +672,10 @@ h2 {{ font-size: 1.1em; color: #8b949e; margin: 20px 0 8px; border-bottom: 1px s
     <div style="color:#8b949e;font-size:0.85em;margin-bottom:8px">{signal_time}</div>
     {alloc_html if alloc_html else '<div class="no-change">No signal found</div>'}
     {'<div class="no-change" style="margin-top:8px">Executive Summary: No change</div>' if parsed and parsed["no_change"] else ""}
-    {'<div style="margin-top:8px;font-size:0.85em;color:#8b949e">BTC Leverage: ' + parsed["btc_leverage"] + '</div>' if parsed and parsed.get("btc_leverage") else ""}
+    {'<div style="margin-top:8px;font-size:0.85em;color:#8b949e">BTC Leverage: ' + _esc(parsed["btc_leverage"]) + '</div>' if parsed and parsed.get("btc_leverage") else ""}
 </div>
 <div class="actions">
-    <a href="?action=force" class="btn btn-action" onclick="return confirm('Force rebalance to current signal?')">Force Rebalance</a>
+    <a href="?action=force&token={os.environ.get('DASHBOARD_TOKEN', '')}" class="btn btn-action" onclick="return confirm('Force rebalance to current signal?')">Force Rebalance</a>
     <a href="?action=health" class="btn btn-action">Health Check</a>
     <a href="?" class="btn btn-action">Refresh</a>
 </div>
