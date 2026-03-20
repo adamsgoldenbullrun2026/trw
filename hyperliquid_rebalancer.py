@@ -30,7 +30,7 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from dotenv import load_dotenv
 
-load_dotenv(Path(__file__).resolve().parent.parent / ".env")
+load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # ── Config ──────────────────────────────────────────────────────────────────
 
